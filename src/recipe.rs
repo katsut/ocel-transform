@@ -53,6 +53,19 @@ pub enum Step {
     /// Drop objects no remaining event references (O2O links to dropped
     /// objects are stripped from survivors).
     DropObjectsWithoutEvents,
+    /// Re-key objects through an alias table (identity resolution as data,
+    /// not code): ids map to their alias or stay as they are; several ids
+    /// mapping to one canonical id merge, and every E2O/O2O reference
+    /// follows.
+    MapObjectIds(AliasTable),
+}
+
+/// The alias table of [`Step::MapObjectIds`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AliasTable {
+    /// old id → canonical id.
+    pub aliases: BTreeMap<String, String>,
 }
 
 impl Step {
@@ -67,6 +80,7 @@ impl Step {
             Step::TimeWindow(_) => "timeWindow",
             Step::KeepObjectTypes(_) => "keepObjectTypes",
             Step::DropObjectsWithoutEvents => "dropObjectsWithoutEvents",
+            Step::MapObjectIds(_) => "mapObjectIds",
         }
     }
 }

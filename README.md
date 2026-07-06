@@ -40,6 +40,7 @@ sources with a live progress bar.
 | `timeWindow` | keep events in the half-open window `[from, to)` (RFC 3339 or `YYYY-MM-DD`; a date-only `to` includes that day) |
 | `keepObjectTypes` | keep objects of these types; events no longer related to any kept object are dropped |
 | `dropObjectsWithoutEvents` | drop objects no remaining event references |
+| `mapObjectIds` | re-key objects through an `{ "aliases": { "old": "canonical" } }` table — identity resolution as data; ids mapping to one canonical id merge, references follow |
 
 Deterministic only: no step invents data. Semantic classification (e.g.
 ML-flagging low-value comments) belongs in annotation attributes written by
