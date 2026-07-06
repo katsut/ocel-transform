@@ -7,5 +7,5 @@
 pub mod apply;
 pub mod recipe;
 
-pub use apply::{apply, StepReport, TransformError};
+pub use apply::{apply, preview, DroppedEvent, StepPreview, StepReport, TransformError};
 pub use recipe::{EventPredicate, Recipe, Step, TimeWindow};

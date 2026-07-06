@@ -64,6 +64,78 @@ pub fn apply(recipe: &Recipe, log: Ocel) -> Result<(Ocel, Vec<StepReport>), Tran
     Ok((log, reports))
 }
 
+/// A dropped event, summarized for a "this is what the recipe deletes"
+/// preview — machine cleaning must stay human-inspectable.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DroppedEvent {
+    pub id: String,
+    pub event_type: String,
+    pub time: DateTime<Utc>,
+    /// (name, value as text) pairs.
+    pub attributes: Vec<(String, String)>,
+}
+
+/// One step's effect plus a sample of the events it removed.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StepPreview {
+    #[serde(flatten)]
+    pub report: StepReport,
+    /// Up to `sample` of the events this step dropped.
+    pub dropped_events: Vec<DroppedEvent>,
+    /// Total events this step dropped (the sample may be shorter).
+    pub dropped_total: usize,
+}
+
+/// Like [`apply`], but additionally samples the events each step drops.
+/// Costs one id-set pass per step; meant for interactive previews.
+pub fn preview(
+    recipe: &Recipe,
+    log: Ocel,
+    sample: usize,
+) -> Result<(Ocel, Vec<StepPreview>), TransformError> {
+    let mut log = log;
+    let mut previews = Vec::with_capacity(recipe.steps.len());
+    for (index, step) in recipe.steps.iter().enumerate() {
+        let before = log.clone();
+        log = apply_step(index, step, log)?;
+        let after_ids: BTreeSet<&str> = log.events.iter().map(|e| e.id.as_str()).collect();
+        let dropped: Vec<&ocel::Event> = before
+            .events
+            .iter()
+            .filter(|e| !after_ids.contains(e.id.as_str()))
+            .collect();
+        let dropped_events = dropped
+            .iter()
+            .take(sample)
+            .map(|e| DroppedEvent {
+                id: e.id.clone(),
+                event_type: e.event_type.clone(),
+                time: e.time,
+                attributes: e
+                    .attributes
+                    .iter()
+                    .map(|a| (a.name.clone(), a.value.to_text()))
+                    .collect(),
+            })
+            .collect();
+        previews.push(StepPreview {
+            report: StepReport {
+                step: step.label().to_owned(),
+                events_before: before.events.len(),
+                events_after: log.events.len(),
+                objects_before: before.objects.len(),
+                objects_after: log.objects.len(),
+            },
+            dropped_events,
+            dropped_total: dropped.len(),
+        });
+    }
+    log.validate().map_err(TransformError::Invalid)?;
+    Ok((log, previews))
+}
+
 fn apply_step(index: usize, step: &Step, log: Ocel) -> Result<Ocel, TransformError> {
     match step {
         Step::DropEventTypes(names) => Ok(with_staging(log, |staging| {

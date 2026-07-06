@@ -210,3 +210,22 @@ fn unknown_recipe_fields_fail_loudly() {
         r#"{ "name": "x", "steps": [ { "dropEventsWhere": { "attr": "a", "regex": "y" } } ] }"#;
     assert!(serde_json::from_str::<Recipe>(json).is_err()); // "regex" is not a field
 }
+
+#[test]
+fn preview_samples_the_dropped_events() {
+    use ocel_transform::preview;
+
+    let steps = vec![Step::DropEventsWhere(EventPredicate {
+        event_type: Some("comment".into()),
+        attr: Some("body".into()),
+        matches: Some(r"(?i)^thanks\W*$".into()),
+        ..EventPredicate::default()
+    })];
+    let (log, previews) = preview(&recipe(steps), sample(), 10).unwrap();
+    assert_eq!(log.events.len(), 5);
+    assert_eq!(previews[0].dropped_total, 1);
+    let dropped = &previews[0].dropped_events;
+    assert_eq!(dropped.len(), 1);
+    assert_eq!(dropped[0].event_type, "comment");
+    assert_eq!(dropped[0].attributes[0].1, "thanks!");
+}
