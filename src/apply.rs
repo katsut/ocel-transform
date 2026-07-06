@@ -171,6 +171,15 @@ fn apply_step(index: usize, step: &Step, log: Ocel) -> Result<Ocel, TransformErr
             Ok(log.filter_object_types(&names))
         }
         Step::DropObjectsWithoutEvents => Ok(drop_objects_without_events(log)),
+        Step::MapObjectIds(table) => Ok(with_staging(log, |staging| {
+            staging.map_object_ids(|id| {
+                table
+                    .aliases
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| id.to_owned())
+            });
+        })),
     }
 }
 

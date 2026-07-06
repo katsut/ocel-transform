@@ -229,3 +229,59 @@ fn preview_samples_the_dropped_events() {
     assert_eq!(dropped[0].event_type, "comment");
     assert_eq!(dropped[0].attributes[0].1, "thanks!");
 }
+
+/// Identity resolution as data: two ids alias to one canonical object,
+/// every reference follows, unmapped ids stay as they are.
+#[test]
+fn map_object_ids_applies_the_alias_table() {
+    use ocel_transform::AliasTable;
+
+    let mut staging = StagingLog::new();
+    staging.upsert_object("alice@corp", "user");
+    staging.upsert_object("@alice", "user");
+    staging.upsert_object("t1", "issue");
+    staging.add_o2o("t1", "@alice", "assigned to");
+    staging.add_event(StagingEvent {
+        id: "e1".into(),
+        event_type: "comment".into(),
+        time: ts(100),
+        attributes: vec![],
+        relations: vec![
+            ("t1".into(), "subject".into()),
+            ("alice@corp".into(), "actor".into()),
+        ],
+    });
+    let log = staging.into_ocel().unwrap();
+
+    let steps = vec![Step::MapObjectIds(AliasTable {
+        aliases: [
+            ("alice@corp".to_owned(), "user:alice".to_owned()),
+            ("@alice".to_owned(), "user:alice".to_owned()),
+        ]
+        .into_iter()
+        .collect(),
+    })];
+    let (out, reports) = apply(&recipe(steps), log).unwrap();
+    assert_eq!(out.validate(), Ok(()));
+    assert_eq!(reports[0].objects_before, 3);
+    assert_eq!(reports[0].objects_after, 2); // the two aliases merged
+    assert!(out.objects.iter().any(|o| o.id == "user:alice"));
+    assert!(out
+        .events
+        .iter()
+        .all(|e| e.relationships.iter().all(|r| r.object_id != "alice@corp")));
+    assert!(out
+        .o2o()
+        .any(|r| r.source_id == "t1" && r.target_id == "user:alice"));
+}
+
+/// The JSON spelling of the alias step round-trips through serde.
+#[test]
+fn map_object_ids_parses_from_json() {
+    let json = r#"{ "name": "identity", "steps": [
+      { "mapObjectIds": { "aliases": { "alice@corp": "user:alice" } } }
+    ] }"#;
+    let recipe: Recipe = serde_json::from_str(json).unwrap();
+    assert_eq!(recipe.steps.len(), 1);
+    assert_eq!(recipe.steps[0].label(), "mapObjectIds");
+}
