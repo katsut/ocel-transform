@@ -5,15 +5,16 @@
 //! the final result is validated once more — a recipe can drop data, but it
 //! can never produce an inconsistent log.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::Path;
 
 use chrono::{DateTime, NaiveDate, Utc};
-use ocel::{AttrValue, Ocel, Violation};
-use ocel_etl::StagingLog;
+use ocel::{AttrValue, Event, Ocel, Relationship, Violation};
+use ocel_etl::{StagingEvent, StagingLog};
 use regex::Regex;
 use thiserror::Error;
 
-use crate::recipe::{EventPredicate, Recipe, Step};
+use crate::recipe::{EventPredicate, LiftEvents, Recipe, RelatedTo, Step};
 
 #[derive(Debug, Error)]
 pub enum TransformError {
@@ -29,6 +30,26 @@ pub enum TransformError {
     #[error("step {step}: value conditions (equals/matches/min/max) require `attr`")]
     ValueConditionWithoutAttr { step: usize },
 
+    #[error("step {step}: union: cannot read {path}: {message}")]
+    UnionRead {
+        step: usize,
+        path: String,
+        message: String,
+    },
+
+    #[error("step {step}: union: {total} events share an id with the current log but differ (e.g. {ids:?}); same-id events must be identical to merge")]
+    UnionConflict {
+        step: usize,
+        total: usize,
+        ids: Vec<String>,
+    },
+
+    #[error("step {step}: keepRelatedTo requires exactly one of `via` / `notVia`")]
+    ViaXorNotVia { step: usize },
+
+    #[error("step {step}: liftEvents requires a non-empty `eventTypes`")]
+    EmptyLiftEventTypes { step: usize },
+
     #[error("the transformed log failed validation: {0:?}")]
     Invalid(Vec<Violation>),
 }
@@ -42,22 +63,44 @@ pub struct StepReport {
     pub events_after: usize,
     pub objects_before: usize,
     pub objects_after: usize,
+    /// `union` only: incoming events skipped because an identical event
+    /// already existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duplicates_skipped: Option<usize>,
+    /// `liftEvents` only: events that gained at least one lifted relation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub events_lifted: Option<usize>,
 }
 
-/// Apply every step of `recipe` in order.
-pub fn apply(recipe: &Recipe, log: Ocel) -> Result<(Ocel, Vec<StepReport>), TransformError> {
+/// Step-specific effect detail beyond the generic before/after counts.
+#[derive(Debug, Clone, Copy, Default)]
+struct StepNotes {
+    duplicates_skipped: Option<usize>,
+    events_lifted: Option<usize>,
+}
+
+/// Apply every step of `recipe` in order. `base_dir` anchors relative file
+/// references in steps like `union` (pass the input log's directory).
+pub fn apply(
+    recipe: &Recipe,
+    log: Ocel,
+    base_dir: &Path,
+) -> Result<(Ocel, Vec<StepReport>), TransformError> {
     let mut log = log;
     let mut reports = Vec::with_capacity(recipe.steps.len());
     for (index, step) in recipe.steps.iter().enumerate() {
         let events_before = log.events.len();
         let objects_before = log.objects.len();
-        log = apply_step(index, step, log)?;
+        let (transformed, notes) = apply_step(index, step, log, base_dir)?;
+        log = transformed;
         reports.push(StepReport {
             step: step.label().to_owned(),
             events_before,
             events_after: log.events.len(),
             objects_before,
             objects_after: log.objects.len(),
+            duplicates_skipped: notes.duplicates_skipped,
+            events_lifted: notes.events_lifted,
         });
     }
     log.validate().map_err(TransformError::Invalid)?;
@@ -93,13 +136,15 @@ pub struct StepPreview {
 pub fn preview(
     recipe: &Recipe,
     log: Ocel,
+    base_dir: &Path,
     sample: usize,
 ) -> Result<(Ocel, Vec<StepPreview>), TransformError> {
     let mut log = log;
     let mut previews = Vec::with_capacity(recipe.steps.len());
     for (index, step) in recipe.steps.iter().enumerate() {
         let before = log.clone();
-        log = apply_step(index, step, log)?;
+        let (transformed, notes) = apply_step(index, step, log, base_dir)?;
+        log = transformed;
         let after_ids: BTreeSet<&str> = log.events.iter().map(|e| e.id.as_str()).collect();
         let dropped: Vec<&ocel::Event> = before
             .events
@@ -127,6 +172,8 @@ pub fn preview(
                 events_after: log.events.len(),
                 objects_before: before.objects.len(),
                 objects_after: log.objects.len(),
+                duplicates_skipped: notes.duplicates_skipped,
+                events_lifted: notes.events_lifted,
             },
             dropped_events,
             dropped_total: dropped.len(),
@@ -136,42 +183,48 @@ pub fn preview(
     Ok((log, previews))
 }
 
-fn apply_step(index: usize, step: &Step, log: Ocel) -> Result<Ocel, TransformError> {
-    match step {
-        Step::DropEventTypes(names) => Ok(with_staging(log, |staging| {
+fn apply_step(
+    index: usize,
+    step: &Step,
+    log: Ocel,
+    base_dir: &Path,
+) -> Result<(Ocel, StepNotes), TransformError> {
+    let mut notes = StepNotes::default();
+    let log = match step {
+        Step::DropEventTypes(names) => with_staging(log, |staging| {
             staging.retain_events(|e| !names.contains(&e.event_type));
-        })),
-        Step::KeepEventTypes(names) => Ok(with_staging(log, |staging| {
+        }),
+        Step::KeepEventTypes(names) => with_staging(log, |staging| {
             staging.retain_events(|e| names.contains(&e.event_type));
-        })),
+        }),
         Step::DropEventsWhere(predicate) => {
             let matcher = Matcher::compile(index, predicate)?;
-            Ok(with_staging(log, |staging| {
+            with_staging(log, |staging| {
                 staging.retain_events(|e| !matcher.matches(&e.event_type, &e.attributes));
-            }))
+            })
         }
-        Step::RenameEventTypes(renames) => Ok(with_staging(log, |staging| {
+        Step::RenameEventTypes(renames) => with_staging(log, |staging| {
             staging.map_events(|e| {
                 if let Some(new_name) = renames.get(&e.event_type) {
                     e.event_type.clone_from(new_name);
                 }
             });
-        })),
+        }),
         Step::TimeWindow(window) => {
             let from = parse_bound(index, window.from.as_deref(), false)?;
             let to = parse_bound(index, window.to.as_deref(), true)?;
-            Ok(with_staging(log, |staging| {
+            with_staging(log, |staging| {
                 staging.retain_events(|e| {
                     from.is_none_or(|f| e.time >= f) && to.is_none_or(|t| e.time < t)
                 });
-            }))
+            })
         }
         Step::KeepObjectTypes(names) => {
             let names: Vec<&str> = names.iter().map(String::as_str).collect();
-            Ok(log.filter_object_types(&names))
+            log.filter_object_types(&names)
         }
-        Step::DropObjectsWithoutEvents => Ok(drop_objects_without_events(log)),
-        Step::MapObjectIds(table) => Ok(with_staging(log, |staging| {
+        Step::DropObjectsWithoutEvents => drop_objects_without_events(log),
+        Step::MapObjectIds(table) => with_staging(log, |staging| {
             staging.map_object_ids(|id| {
                 table
                     .aliases
@@ -179,8 +232,26 @@ fn apply_step(index: usize, step: &Step, log: Ocel) -> Result<Ocel, TransformErr
                     .cloned()
                     .unwrap_or_else(|| id.to_owned())
             });
-        })),
-    }
+        }),
+        Step::Union(source) => {
+            let (merged, duplicates) = union_logs(index, &source.file, base_dir, log)?;
+            notes.duplicates_skipped = Some(duplicates);
+            merged
+        }
+        Step::KeepRelatedTo(related) => {
+            let expansion = Expansion::compile(index, related)?;
+            keep_related_to(&log, &related.object_type, &expansion)
+        }
+        Step::LiftEvents(lift) => {
+            if lift.event_types.is_empty() {
+                return Err(TransformError::EmptyLiftEventTypes { step: index });
+            }
+            let (lifted_log, lifted) = lift_events(log, lift);
+            notes.events_lifted = Some(lifted);
+            lifted_log
+        }
+    };
+    Ok((log, notes))
 }
 
 /// Round-trip through the staging representation; the gate cannot fail here
@@ -210,6 +281,243 @@ fn drop_objects_without_events(log: Ocel) -> Ocel {
         })
         .collect();
     Ocel { objects, ..log }
+}
+
+/// Merge the OCEL file at `file` (resolved against `base_dir`) into `log`.
+///
+/// The current log seeds a [`StagingLog`]; the other log's objects upsert
+/// into it (same-id objects merge: types unify, attribute observations and
+/// O2O relations append), then its events are added. Same-id events must be
+/// identical — identical ones are skipped and counted, differing ones fail
+/// with the conflicting ids. Returns the merged log and the skip count.
+fn union_logs(
+    step: usize,
+    file: &str,
+    base_dir: &Path,
+    log: Ocel,
+) -> Result<(Ocel, usize), TransformError> {
+    let path = base_dir.join(file);
+    let other = ocel::io::read_path(&path).map_err(|e| TransformError::UnionRead {
+        step,
+        path: path.display().to_string(),
+        message: e.to_string(),
+    })?;
+
+    let ours: BTreeMap<&str, &Event> = log.events.iter().map(|e| (e.id.as_str(), e)).collect();
+    let mut duplicates = 0usize;
+    let mut conflicts: Vec<String> = Vec::new();
+    for theirs in &other.events {
+        match ours.get(theirs.id.as_str()) {
+            Some(&existing) if existing == theirs => duplicates += 1,
+            Some(_) => conflicts.push(theirs.id.clone()),
+            None => {}
+        }
+    }
+    if !conflicts.is_empty() {
+        let total = conflicts.len();
+        conflicts.truncate(5);
+        return Err(TransformError::UnionConflict {
+            step,
+            total,
+            ids: conflicts,
+        });
+    }
+
+    let known: BTreeSet<String> = log.events.iter().map(|e| e.id.clone()).collect();
+    let mut staging = StagingLog::from_ocel(log);
+    for object in other.objects {
+        staging.upsert_object(&object.id, &object.object_type);
+        for attr in object.attributes {
+            staging.add_object_attribute(&object.id, &attr.name, attr.value, attr.time);
+        }
+        for rel in object.relationships {
+            staging.add_o2o(&object.id, &rel.object_id, &rel.qualifier);
+        }
+    }
+    for event in other.events {
+        if known.contains(&event.id) {
+            continue; // an identical duplicate, counted above
+        }
+        staging.add_event(StagingEvent {
+            id: event.id,
+            event_type: event.event_type,
+            time: event.time,
+            attributes: event
+                .attributes
+                .into_iter()
+                .map(|a| (a.name, a.value))
+                .collect(),
+            relations: event
+                .relationships
+                .into_iter()
+                .map(|r| (r.object_id, r.qualifier))
+                .collect(),
+        });
+    }
+    let merged = staging.into_ocel().map_err(TransformError::Invalid)?;
+    Ok((merged, duplicates))
+}
+
+/// Which object types a `keepRelatedTo` walk may continue through.
+enum Expansion<'a> {
+    Via(BTreeSet<&'a str>),
+    NotVia(BTreeSet<&'a str>),
+}
+
+impl<'a> Expansion<'a> {
+    fn compile(step: usize, spec: &'a RelatedTo) -> Result<Expansion<'a>, TransformError> {
+        match (&spec.via, &spec.not_via) {
+            (Some(via), None) => Ok(Expansion::Via(via.iter().map(String::as_str).collect())),
+            (None, Some(not_via)) => Ok(Expansion::NotVia(
+                not_via.iter().map(String::as_str).collect(),
+            )),
+            _ => Err(TransformError::ViaXorNotVia { step }),
+        }
+    }
+
+    fn allows(&self, object_type: &str) -> bool {
+        match self {
+            Expansion::Via(types) => types.contains(object_type),
+            Expansion::NotVia(types) => !types.contains(object_type),
+        }
+    }
+}
+
+/// BFS over the object interaction graph (shared events + O2O, either
+/// direction) from every object of `seed_type`. Every reached object is
+/// kept; the walk continues through it only if its type is allowed (seeds
+/// always are). The result is a consistent sub-log with the same semantics
+/// as the core's object filters: E2O/O2O to dropped objects are stripped,
+/// events left without any object are dropped, declarations stay.
+fn keep_related_to(log: &Ocel, seed_type: &str, expansion: &Expansion<'_>) -> Ocel {
+    let graph = log.object_graph();
+    let types: BTreeMap<&str, &str> = log
+        .objects
+        .iter()
+        .map(|o| (o.id.as_str(), o.object_type.as_str()))
+        .collect();
+    let mut kept: BTreeSet<&str> = log
+        .objects
+        .iter()
+        .filter(|o| o.object_type == seed_type)
+        .map(|o| o.id.as_str())
+        .collect();
+    let mut expanded = kept.clone();
+    let mut queue: VecDeque<&str> = kept.iter().copied().collect();
+    while let Some(id) = queue.pop_front() {
+        for neighbor in graph.neighbors(id) {
+            kept.insert(neighbor);
+            let walkable = types
+                .get(neighbor)
+                .copied()
+                .is_some_and(|ty| expansion.allows(ty));
+            if walkable && expanded.insert(neighbor) {
+                queue.push_back(neighbor);
+            }
+        }
+    }
+
+    let events = log
+        .events
+        .iter()
+        .filter_map(|e| {
+            let mut event = e.clone();
+            event
+                .relationships
+                .retain(|r| kept.contains(r.object_id.as_str()));
+            (!event.relationships.is_empty()).then_some(event)
+        })
+        .collect();
+    let objects = log
+        .objects
+        .iter()
+        .filter(|o| kept.contains(o.id.as_str()))
+        .map(|o| {
+            let mut object = o.clone();
+            object
+                .relationships
+                .retain(|r| kept.contains(r.object_id.as_str()));
+            object
+        })
+        .collect();
+    Ocel {
+        event_types: log.event_types.clone(),
+        object_types: log.object_types.clone(),
+        events,
+        objects,
+    }
+}
+
+/// For each event of the listed types related to a `from`-type object F, add
+/// an E2O relation to every `to`-type object O2O-linked with F (either
+/// direction), unless the event already relates to it. Returns the log and
+/// the number of events that gained at least one relation.
+fn lift_events(mut log: Ocel, spec: &LiftEvents) -> (Ocel, usize) {
+    let from_ids: BTreeSet<&str> = log
+        .objects
+        .iter()
+        .filter(|o| o.object_type == spec.from)
+        .map(|o| o.id.as_str())
+        .collect();
+    let to_ids: BTreeSet<&str> = log
+        .objects
+        .iter()
+        .filter(|o| o.object_type == spec.to)
+        .map(|o| o.id.as_str())
+        .collect();
+    // from-object id -> to-object ids O2O-linked with it, either direction
+    let mut linked: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for object in &log.objects {
+        if from_ids.contains(object.id.as_str()) {
+            for rel in &object.relationships {
+                if to_ids.contains(rel.object_id.as_str()) {
+                    linked
+                        .entry(object.id.as_str())
+                        .or_default()
+                        .insert(rel.object_id.as_str());
+                }
+            }
+        }
+        if to_ids.contains(object.id.as_str()) {
+            for rel in &object.relationships {
+                if from_ids.contains(rel.object_id.as_str()) {
+                    linked
+                        .entry(rel.object_id.as_str())
+                        .or_default()
+                        .insert(object.id.as_str());
+                }
+            }
+        }
+    }
+
+    let mut lifted = 0usize;
+    for event in &mut log.events {
+        if !spec.event_types.contains(&event.event_type) {
+            continue;
+        }
+        let mut targets: BTreeSet<&str> = BTreeSet::new();
+        for rel in &event.relationships {
+            if let Some(found) = linked.get(rel.object_id.as_str()) {
+                targets.extend(found.iter().copied());
+            }
+        }
+        let additions: Vec<String> = targets
+            .into_iter()
+            .filter(|t| event.relationships.iter().all(|r| r.object_id != *t))
+            .map(ToOwned::to_owned)
+            .collect();
+        if additions.is_empty() {
+            continue;
+        }
+        lifted += 1;
+        for object_id in additions {
+            event.relationships.push(Relationship {
+                object_id,
+                qualifier: spec.qualifier.clone(),
+            });
+        }
+    }
+    (log, lifted)
 }
 
 /// A compiled event predicate.

@@ -8,4 +8,6 @@ pub mod apply;
 pub mod recipe;
 
 pub use apply::{apply, preview, DroppedEvent, StepPreview, StepReport, TransformError};
-pub use recipe::{AliasTable, EventPredicate, Recipe, Step, TimeWindow};
+pub use recipe::{
+    AliasTable, EventPredicate, LiftEvents, Recipe, RelatedTo, Step, TimeWindow, UnionSource,
+};

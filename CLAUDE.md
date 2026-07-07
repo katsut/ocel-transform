@@ -19,10 +19,11 @@ After changing the binary: `cargo install --path .` (the studio resolves
 
 - `src/recipe.rs` — the `Step` vocabulary (dropEventTypes / keepEventTypes /
   dropEventsWhere with equals/matches/min/max / renameEventTypes /
-  timeWindow / keepObjectTypes / dropObjectsWithoutEvents / mapObjectIds);
-  externally tagged serde, `deny_unknown_fields`, predicates compiled (and
-  rejected) at load
-- `src/apply.rs` — `apply` + `preview` (per-step dropped-event samples with
+  timeWindow / keepObjectTypes / dropObjectsWithoutEvents / mapObjectIds /
+  union / keepRelatedTo / liftEvents); externally tagged serde,
+  `deny_unknown_fields`, predicates compiled (and rejected) at load
+- `src/apply.rs` — `apply` + `preview` (both take the input log's directory,
+  which anchors `union` file references; per-step dropped-event samples with
   true counts, via before-clone + id diff)
 - `src/main.rs` — CLI, connector contract v1/v2 (NDJSON progress/log/done,
   honest per-step before/after counts on stderr)
