@@ -58,6 +58,18 @@ pub enum Step {
     /// mapping to one canonical id merge, and every E2O/O2O reference
     /// follows.
     MapObjectIds(AliasTable),
+    /// Merge another OCEL file into the log. Same-id objects merge with
+    /// staging semantics (shared users/accounts unify); same-id events must
+    /// be identical — identical ones are skipped and counted, differing ones
+    /// fail the step.
+    Union(UnionSource),
+    /// Keep only the objects reachable from the objects of one type over
+    /// shared events and O2O links, walking only through allowed types;
+    /// events no longer related to any kept object are dropped.
+    KeepRelatedTo(RelatedTo),
+    /// Add E2O relations lifting events from objects of one type to the
+    /// objects of another type they are O2O-linked with (both directions).
+    LiftEvents(LiftEvents),
 }
 
 /// The alias table of [`Step::MapObjectIds`].
@@ -66,6 +78,51 @@ pub enum Step {
 pub struct AliasTable {
     /// old id → canonical id.
     pub aliases: BTreeMap<String, String>,
+}
+
+/// The source file of [`Step::Union`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UnionSource {
+    /// Path of the OCEL file to merge, resolved against the input log's
+    /// directory.
+    pub file: String,
+}
+
+/// The reachability spec of [`Step::KeepRelatedTo`]. Exactly one of `via` /
+/// `notVia` must be set. A reached object is always kept, but the walk
+/// continues through it only if its type is allowed (in `via`, or not in
+/// `notVia`) — endpoints of other types are kept without being expanded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RelatedTo {
+    /// The seed type: every object of this type is kept and expanded.
+    pub object_type: String,
+    /// Object types the walk may continue through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<Vec<String>>,
+    /// Object types the walk stops at (every other type is walkable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_via: Option<Vec<String>>,
+}
+
+/// The lift spec of [`Step::LiftEvents`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LiftEvents {
+    /// Type of the objects the events currently relate to.
+    pub from: String,
+    /// Type of the O2O-linked objects the events are lifted to.
+    pub to: String,
+    /// Only events of these types are lifted (required, non-empty).
+    pub event_types: Vec<String>,
+    /// Qualifier of the added E2O relations.
+    #[serde(default = "default_lift_qualifier")]
+    pub qualifier: String,
+}
+
+fn default_lift_qualifier() -> String {
+    "lifted".to_owned()
 }
 
 impl Step {
@@ -81,6 +138,9 @@ impl Step {
             Step::KeepObjectTypes(_) => "keepObjectTypes",
             Step::DropObjectsWithoutEvents => "dropObjectsWithoutEvents",
             Step::MapObjectIds(_) => "mapObjectIds",
+            Step::Union(_) => "union",
+            Step::KeepRelatedTo(_) => "keepRelatedTo",
+            Step::LiftEvents(_) => "liftEvents",
         }
     }
 }

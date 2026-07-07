@@ -1,5 +1,6 @@
 use std::error::Error;
-use std::path::PathBuf;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -59,10 +60,15 @@ fn run(cli: &Cli) -> Result<(), Box<dyn Error>> {
         log.objects.len()
     );
 
+    // relative file references in steps like `union` resolve next to the input
+    let base_dir = match cli.input.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
     let total = recipe.steps.len();
-    let (transformed, reports) = apply(&recipe, log)?;
+    let (transformed, reports) = apply(&recipe, log, base_dir)?;
     for (index, report) in reports.iter().enumerate() {
-        let line = format!(
+        let mut line = format!(
             "{}: events {} -> {}, objects {} -> {}",
             report.step,
             report.events_before,
@@ -70,6 +76,12 @@ fn run(cli: &Cli) -> Result<(), Box<dyn Error>> {
             report.objects_before,
             report.objects_after
         );
+        if let Some(skipped) = report.duplicates_skipped {
+            write!(line, ", {skipped} duplicates skipped").expect("writing to a String");
+        }
+        if let Some(lifted) = report.events_lifted {
+            write!(line, ", lifted {lifted} events").expect("writing to a String");
+        }
         eprintln!("  {line}");
         emit_log(&line);
         emit_progress(&report.step, index + 1, total);

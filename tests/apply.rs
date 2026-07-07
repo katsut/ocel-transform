@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use chrono::{DateTime, Utc};
 use ocel::AttrValue;
 use ocel_etl::{StagingEvent, StagingLog};
@@ -57,7 +59,7 @@ fn gratitude_comments_drop_by_regex_and_real_ones_stay() {
         matches: Some(r"(?i)^(thanks|thank you|lgtm)\W*$".into()),
         ..EventPredicate::default()
     })];
-    let (log, reports) = apply(&recipe(steps), sample()).unwrap();
+    let (log, reports) = apply(&recipe(steps), sample(), Path::new(".")).unwrap();
     assert_eq!(log.validate(), Ok(()));
     assert_eq!(reports[0].events_before, 6);
     assert_eq!(reports[0].events_after, 5);
@@ -80,7 +82,7 @@ fn rename_merges_labeled_and_unlabeled_into_triage() {
         .into_iter()
         .collect(),
     )];
-    let (log, _) = apply(&recipe(steps), sample()).unwrap();
+    let (log, _) = apply(&recipe(steps), sample(), Path::new(".")).unwrap();
     assert_eq!(
         log.events
             .iter()
@@ -97,7 +99,7 @@ fn time_window_is_half_open_and_keeps_objects() {
         from: Some("1970-01-01T00:03:20Z".into()), // ts(200)
         to: Some("1970-01-01T00:08:20Z".into()),   // ts(500), exclusive
     })];
-    let (log, _) = apply(&recipe(steps), sample()).unwrap();
+    let (log, _) = apply(&recipe(steps), sample(), Path::new(".")).unwrap();
     let ids: Vec<&str> = log.events.iter().map(|e| e.id.as_str()).collect();
     assert_eq!(ids, vec!["e2", "e3", "e4"]);
     // objects are untouched by the window
@@ -112,7 +114,7 @@ fn drop_event_types_then_cleanup_removes_orphans() {
         Step::KeepEventTypes(vec!["comment".into()]),
         Step::DropObjectsWithoutEvents,
     ];
-    let (log, reports) = apply(&recipe(steps), sample()).unwrap();
+    let (log, reports) = apply(&recipe(steps), sample(), Path::new(".")).unwrap();
     assert_eq!(log.validate(), Ok(()));
     assert_eq!(log.events.len(), 2);
     // u1 had no events of its own -> dropped; t1 stays
@@ -129,7 +131,7 @@ fn keep_object_types_drops_unrelated_events() {
     // keeping only "user" objects leaves every event unrelated (all events
     // reference the issue t1) -> events drop with their subject
     let steps = vec![Step::KeepObjectTypes(vec!["user".into()])];
-    let (log, _) = apply(&recipe(steps), sample()).unwrap();
+    let (log, _) = apply(&recipe(steps), sample(), Path::new(".")).unwrap();
     assert_eq!(log.validate(), Ok(()));
     assert_eq!(log.events.len(), 0);
     assert_eq!(log.objects.len(), 1);
@@ -158,7 +160,7 @@ fn numeric_range_predicate() {
         max: Some(10.0),
         ..EventPredicate::default()
     })];
-    let (out, _) = apply(&recipe(steps), log).unwrap();
+    let (out, _) = apply(&recipe(steps), log, Path::new(".")).unwrap();
     let ids: Vec<&str> = out.events.iter().map(|e| e.id.as_str()).collect();
     assert_eq!(ids, vec!["e2"]);
 }
@@ -166,7 +168,7 @@ fn numeric_range_predicate() {
 #[test]
 fn empty_predicate_is_rejected() {
     let steps = vec![Step::DropEventsWhere(EventPredicate::default())];
-    let err = apply(&recipe(steps), sample()).unwrap_err();
+    let err = apply(&recipe(steps), sample(), Path::new(".")).unwrap_err();
     assert!(err.to_string().contains("no conditions"), "{err}");
 }
 
@@ -177,7 +179,7 @@ fn value_condition_without_attr_is_rejected() {
         matches: Some("x".into()),
         ..EventPredicate::default()
     })];
-    let err = apply(&recipe(steps), sample()).unwrap_err();
+    let err = apply(&recipe(steps), sample(), Path::new(".")).unwrap_err();
     assert!(err.to_string().contains("require `attr`"), "{err}");
 }
 
@@ -197,7 +199,7 @@ fn full_recipe_parses_from_json_and_applies() {
     }"#;
     let recipe: Recipe = serde_json::from_str(json).unwrap();
     assert_eq!(recipe.steps.len(), 6);
-    let (log, reports) = apply(&recipe, sample()).unwrap();
+    let (log, reports) = apply(&recipe, sample(), Path::new(".")).unwrap();
     assert_eq!(log.validate(), Ok(()));
     assert_eq!(reports.len(), 6);
     // the whole sample happens on 1970-01-01, whose date-window keeps it all
@@ -221,7 +223,7 @@ fn preview_samples_the_dropped_events() {
         matches: Some(r"(?i)^thanks\W*$".into()),
         ..EventPredicate::default()
     })];
-    let (log, previews) = preview(&recipe(steps), sample(), 10).unwrap();
+    let (log, previews) = preview(&recipe(steps), sample(), Path::new("."), 10).unwrap();
     assert_eq!(log.events.len(), 5);
     assert_eq!(previews[0].dropped_total, 1);
     let dropped = &previews[0].dropped_events;
@@ -261,7 +263,7 @@ fn map_object_ids_applies_the_alias_table() {
         .into_iter()
         .collect(),
     })];
-    let (out, reports) = apply(&recipe(steps), log).unwrap();
+    let (out, reports) = apply(&recipe(steps), log, Path::new(".")).unwrap();
     assert_eq!(out.validate(), Ok(()));
     assert_eq!(reports[0].objects_before, 3);
     assert_eq!(reports[0].objects_after, 2); // the two aliases merged

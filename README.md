@@ -41,6 +41,9 @@ sources with a live progress bar.
 | `keepObjectTypes` | keep objects of these types; events no longer related to any kept object are dropped |
 | `dropObjectsWithoutEvents` | drop objects no remaining event references |
 | `mapObjectIds` | re-key objects through an `{ "aliases": { "old": "canonical" } }` table — identity resolution as data; ids mapping to one canonical id merge, references follow |
+| `union` | merge another OCEL file (`{ "file": "other.sqlite" }`, resolved next to `--in`): same-id objects merge, identical same-id events are skipped and counted, differing ones fail |
+| `keepRelatedTo` | keep every object of `objectType` plus everything reachable over shared events / O2O links, walking only through `via` types (or every type not in `notVia`); reached objects of other types are kept but not walked through |
+| `liftEvents` | add an E2O relation (`qualifier`, default `"lifted"`) from each event of `eventTypes` on a `from`-type object to the `to`-type objects it is O2O-linked with (either direction) |
 
 Deterministic only: no step invents data. Semantic classification (e.g.
 ML-flagging low-value comments) belongs in annotation attributes written by
